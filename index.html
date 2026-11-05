@@ -670,6 +670,8 @@
         .online-box { font-size: 0.82rem; line-height: 1.55; display: flex; flex-direction: column; gap: 0.6rem; }
         .online-box .row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
         .online-box a.btn-ghost, .storage-row a.btn-ghost { text-decoration: none; display: inline-block; }
+        .connect-box summary { cursor: pointer; font-weight: 600; font-size: 0.8rem; color: var(--text-secondary); }
+        .connect-box summary:hover { color: var(--text-primary); }
         .online-badge { display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.75rem; font-weight: 600; color: var(--emerald); border: 1px solid currentColor; border-radius: 999px; padding: 0.1rem 0.55rem; }
 
         /* Kho dữ liệu tuần */
@@ -2084,7 +2086,7 @@
             const items = sources.map(s => `
                 <li><span class="src-name" title="${esc(s.name)}">${esc(rangeLabel(s.range || sourceRange(s)))}<br><span class="hint">${esc(s.name)}</span></span>
                     <span class="src-count">${s.records.length} đơn</span>
-                    ${s.isRemote ? '<span></span>' : `<button data-source="${esc(s.name)}" title="Xoá tuần này khỏi kho" aria-label="Xoá ${esc(s.name)}">✕</button>`}</li>`).reverse();
+                    ${s.isRemote && !(ONLINE && getToken()) ? '<span></span>' : `<button data-source="${esc(s.name)}" title="${s.isRemote ? 'Xoá tuần này khỏi GitHub' : 'Xoá tuần này khỏi kho'}" aria-label="Xoá ${esc(s.name)}">✕</button>`}</li>`).reverse();
             if (hasManual) items.unshift(`<li><span class="src-name">Nhập thủ công</span><span class="src-count">${manualRecords.length} đơn</span><span></span></li>`);
             list.innerHTML = items.join('');
             const rows = sources.reduce((s, x) => s + x.records.length, 0) + manualRecords.length;
@@ -2902,7 +2904,9 @@
                 const res = await listViaApi(repo, branch);
                 if (res) { files = res.files; via = 'api'; stale = !!res.stale; }
             }
-            if (!files && !SITE_CONFIG.online) return false;
+            // Trên *.github.io luôn là chế độ online; nếu không đọc được danh sách file thì báo lỗi rõ ràng
+            const onPages = /\.github\.io$/i.test(location.hostname);
+            if (!files && !SITE_CONFIG.online && !onPages) return false;
             ONLINE = { repo, branch, files: files || [], via, stale, error: !files, loadedAt: null };
             return true;
         }
@@ -2910,12 +2914,34 @@
         async function loadOnlineData() {
             const out = [];
             const failed = [];
+            ONLINE.sha = {};
+            ONLINE.viaToken = false;
+            // Người cập nhật (đã kết nối mã): đọc thẳng từ GitHub nên thấy ngay file vừa upload, không phải chờ Pages dựng lại
+            if (getToken()) {
+                try {
+                    const r = await gh('/contents/data?ref=' + encodeURIComponent(ONLINE.branch));
+                    if (r.ok) {
+                        const list = (await r.json()).filter(x => x.type === 'file' && isDataFile(x.name));
+                        list.forEach(x => { ONLINE.sha[x.name] = x.sha; });
+                        ONLINE.files = list.map(x => ({ name: x.name, v: x.sha }));
+                        ONLINE.viaToken = true;
+                        ONLINE.error = false;
+                    } else if (r.status === 404) {
+                        ONLINE.files = []; ONLINE.viaToken = true; ONLINE.error = false;
+                    } else if (r.status === 401) {
+                        setToken('');
+                        showToast('Mã truy cập GitHub đã hết hạn hoặc bị xoá. Hãy tạo mã mới rồi kết nối lại.', 'error');
+                    }
+                } catch (e) { /* mất mạng: dùng danh sách thường */ }
+            }
             const queue = ONLINE.files.slice();
             const worker = async () => {
                 while (queue.length) {
                     const f = queue.shift();
                     try {
-                        const r = await fetch('data/' + encodeURIComponent(f.name) + '?v=' + encodeURIComponent(f.v || ''), { cache: 'no-cache' });
+                        const r = ONLINE.viaToken
+                            ? await gh(dataPath(f.name) + '?ref=' + encodeURIComponent(ONLINE.branch), { headers: { Accept: 'application/vnd.github.raw' } })
+                            : await fetch('data/' + encodeURIComponent(f.name) + '?v=' + encodeURIComponent(f.v || ''), { cache: 'no-cache' });
                         if (!r.ok) throw new Error(r.status);
                         const bytes = new Uint8Array(await r.arrayBuffer());
                         const res = parseRows(readWorkbook(bytes, /\.csv$/i.test(f.name)));
@@ -2928,6 +2954,170 @@
             ONLINE.loadedAt = new Date();
             ONLINE.failed = failed;
             return out;
+        }
+
+
+        // ----- Người cập nhật: kết nối GitHub bằng mã truy cập, upload ngay trên trang -----
+        const tokenKey = () => 'ghToken:' + ((ONLINE && ONLINE.repo) || '');
+        function getToken() { try { return localStorage.getItem(tokenKey()) || ''; } catch (e) { return ''; } }
+        function setToken(t) { try { if (t) localStorage.setItem(tokenKey(), t); else localStorage.removeItem(tokenKey()); } catch (e) { /* bỏ qua */ } }
+        const dataPath = name => '/contents/data/' + encodeURIComponent(name);
+        function gh(path, opts) {
+            opts = opts || {};
+            return fetch('https://api.github.com/repos/' + ONLINE.repo + path, Object.assign({}, opts, {
+                headers: Object.assign({ Accept: 'application/vnd.github+json', Authorization: 'Bearer ' + getToken(), 'X-GitHub-Api-Version': '2022-11-28' }, opts.headers || {})
+            }));
+        }
+        function bytesToBase64(bytes) {
+            let bin = '';
+            for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+            return btoa(bin);
+        }
+        function ghErrorText(status) {
+            if (status === 401) return 'Mã truy cập sai hoặc đã hết hạn. Tạo mã mới rồi kết nối lại.';
+            if (status === 403 || status === 404) return 'Mã truy cập chưa có quyền ghi vào repository này. Khi tạo mã, chọn đúng repository và quyền Contents: Read and write.';
+            if (status === 409 || status === 422) return 'File vừa bị thay đổi ở nơi khác. Bấm "Tải lại dữ liệu" rồi thử lại.';
+            return 'GitHub báo lỗi (' + status + '). Thử lại sau ít phút.';
+        }
+
+        async function connectToken(raw) {
+            const tok = String(raw || '').trim();
+            if (!tok) { showToast('Hãy dán mã truy cập vào ô trước khi bấm Kết nối.', 'error'); return; }
+            if (!ONLINE.repo) { showToast('Không xác định được repository. Điền "repo" trong config.json (ví dụ "ten-tai-khoan/ten-repo").', 'error'); return; }
+            setToken(tok);
+            let r;
+            try { r = await gh(''); } catch (e) { setToken(''); showToast('Không kết nối được GitHub. Kiểm tra mạng rồi thử lại.', 'error'); return; }
+            if (!r.ok) { setToken(''); showToast(ghErrorText(r.status), 'error'); renderOnlineBox(); return; }
+            showToast('Đã kết nối GitHub trên máy này. Giờ bạn kéo thả file tuần vào trang là được.', 'success');
+            await startOnline(true);
+        }
+
+        function disconnectToken() {
+            setToken('');
+            showToast('Đã ngắt kết nối GitHub trên máy này.', 'success');
+            startOnline(true);
+        }
+
+        async function ghDeleteFile(name) {
+            const sha = ONLINE.sha && ONLINE.sha[name];
+            if (!sha) throw { status: 409 };
+            const r = await gh(dataPath(name), { method: 'DELETE', body: JSON.stringify({ message: 'Xoá tuần: ' + name, sha, branch: ONLINE.branch }) });
+            if (!r.ok) throw { status: r.status };
+            delete ONLINE.sha[name];
+        }
+
+        let onlineBusy = false;
+        async function uploadWeekFiles(fileList) {
+            if (onlineBusy) return;
+            if (!xlsxReady()) return;
+            onlineBusy = true;
+            renderOnlineBox();
+            const saved = [];
+            try {
+                for (const file of Array.from(fileList)) {
+                    const bytes = await readFileAsArrayBuffer(file);
+                    let res;
+                    try { res = parseRows(readWorkbook(bytes, /\.(csv|txt)$/i.test(file.name))); } catch (e) { res = { error: 'không đọc được file' }; }
+                    if (res.error) { showToast(`Không lưu "${file.name}": ${res.error}.`, 'error'); continue; }
+                    const src = { name: file.name, records: res.records, isRemote: true };
+                    src.records.forEach(r => { r.source = src.name; });
+                    src.range = sourceRange(src);
+
+                    const clash = sources.find(s => s.name !== src.name && rangesOverlap(s.range || sourceRange(s), src.range));
+                    if (clash) {
+                        const choice = await askInPage(
+                            `File <b>${esc(src.name)}</b> (${esc(rangeLabel(src.range))}) có ngày trùng với tuần đã lưu <b>${esc(clash.name)}</b> (${esc(rangeLabel(clash.range || sourceRange(clash)))}). Nếu giữ cả hai, những đơn trong khoảng ngày trùng sẽ bị đếm 2 lần.`,
+                            [{ label: 'Thay tuần đã lưu bằng file mới', value: 'replace' }, { label: 'Giữ cả hai', value: 'both' }, { label: 'Bỏ qua file mới', value: 'skip' }]);
+                        if (choice === 'skip') continue;
+                        if (choice === 'replace') {
+                            try { await ghDeleteFile(clash.name); sources = sources.filter(s => s.name !== clash.name); }
+                            catch (e) { showToast('Không xoá được tuần cũ: ' + ghErrorText(e.status), 'error'); continue; }
+                        }
+                    }
+
+                    const body = { message: `Cập nhật tuần ${rangeLabel(src.range)}: ${src.name}`, content: bytesToBase64(bytes), branch: ONLINE.branch };
+                    if (ONLINE.sha[src.name]) body.sha = ONLINE.sha[src.name]; // cùng tên → ghi đè
+                    const r = await gh(dataPath(src.name), { method: 'PUT', body: JSON.stringify(body) });
+                    if (!r.ok) {
+                        showToast(`Không lưu được "${src.name}": ${ghErrorText(r.status)}`, 'error');
+                        if (r.status === 401) { setToken(''); break; }
+                        continue;
+                    }
+                    const j = await r.json();
+                    ONLINE.sha[src.name] = j.content && j.content.sha;
+                    sources = sources.filter(s => s.name !== src.name).concat([src]);
+                    saved.push(src);
+                }
+            } finally {
+                onlineBusy = false;
+            }
+            if (saved.length) {
+                sources.sort((a, b) => ((a.range && a.range.min) || 8.64e15) - ((b.range && b.range.min) || 8.64e15));
+                showDashboard();
+                updateDataProcessing();
+                const last = saved[saved.length - 1].range;
+                const mk = last.max && monthKeysOf(combinedRecords).find(m => m.y === last.max.getFullYear() && m.m === last.max.getMonth() + 1);
+                if (mk) selectMonth(mk);
+                showToast(`Đã lưu ${saved.length} tuần lên GitHub (${saved.map(x => rangeLabel(x.range)).join(', ')}). Người khác sẽ thấy sau khoảng 1–2 phút.`, 'success');
+            }
+            renderOnlineBox();
+            renderArchiveTab();
+        }
+
+        async function deleteRemoteWeek(name) {
+            try {
+                await ghDeleteFile(name);
+                sources = sources.filter(s => s.name !== name);
+                updateDataProcessing();
+                renderOnlineBox();
+                showToast(`Đã xoá "${name}" khỏi GitHub. Người khác sẽ thấy sau khoảng 1–2 phút.`, 'success');
+                if (!sources.length) showEmptyState();
+            } catch (e) {
+                showToast('Không xoá được: ' + ghErrorText(e.status), 'error');
+            }
+        }
+
+        function uploaderHtml() {
+            if (!ONLINE.repo) return '';
+            if (getToken()) {
+                return `
+                <div class="upload-zone" id="onlineDrop" role="button" tabindex="0" style="padding:1.5rem 1rem; gap:0.5rem;${onlineBusy ? ' opacity:0.6; pointer-events:none;' : ''}">
+                    <div class="upload-icon" style="width:2.6rem; height:2.6rem; font-size:1.2rem;">📤</div>
+                    <div><p style="font-weight:600; font-size:0.88rem;">${onlineBusy ? 'Đang lưu lên GitHub…' : 'Kéo thả file tuần vào đây'}</p>
+                    <p style="font-size:0.75rem; color: var(--text-secondary);">file được lưu thẳng vào thư mục data · hoặc bấm để chọn</p></div>
+                </div>
+                <input type="file" id="onlineFileInput" class="file-input" accept=".xlsx, .xls, .csv" multiple>
+                <div class="hint">🔑 Máy này đã kết nối GitHub để cập nhật dữ liệu · <a href="#" id="lnkDisconnect" style="color: var(--accent);">Ngắt kết nối</a></div>`;
+            }
+            return `
+                <details class="connect-box">
+                    <summary>🔑 Bạn là người cập nhật dữ liệu?</summary>
+                    <div style="display:flex; flex-direction:column; gap:0.5rem; margin-top:0.6rem;">
+                        <label for="tokenInput" class="hint">Dán mã truy cập GitHub (bắt đầu bằng <code>github_pat_</code>). Mã chỉ lưu trên máy này, người khác không thấy.</label>
+                        <input type="password" class="form-control" id="tokenInput" placeholder="github_pat_…" autocomplete="off">
+                        <button class="btn-copy" id="btnConnect" style="justify-content:center;">Kết nối</button>
+                    </div>
+                </details>`;
+        }
+
+        function wireUploader() {
+            const drop = document.getElementById('onlineDrop');
+            if (drop) {
+                const input = document.getElementById('onlineFileInput');
+                drop.addEventListener('click', () => input.click());
+                drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } });
+                ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('dragover'); }));
+                ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('dragover'); }));
+                drop.addEventListener('drop', e => { if (e.dataTransfer.files.length) uploadWeekFiles(e.dataTransfer.files); });
+                input.addEventListener('change', e => { if (e.target.files.length) uploadWeekFiles(e.target.files); e.target.value = ''; });
+                document.getElementById('lnkDisconnect').addEventListener('click', e => { e.preventDefault(); disconnectToken(); });
+            }
+            const btn = document.getElementById('btnConnect');
+            if (btn) {
+                const inp = document.getElementById('tokenInput');
+                btn.addEventListener('click', () => connectToken(inp.value));
+                inp.addEventListener('keydown', e => { if (e.key === 'Enter') connectToken(inp.value); });
+            }
         }
 
         function githubLinks() {
@@ -2944,14 +3134,16 @@
                 <div><span class="online-badge">● Online</span></div>
                 <div>Dữ liệu lấy từ thư mục <b>data</b> trên GitHub${ONLINE.repo ? ` (<b>${esc(ONLINE.repo)}</b>)` : ''}: <b>${sources.length} tuần</b>${t ? ', tải lúc ' + t : ''}.</div>
                 ${ONLINE.stale ? '<div class="hint">⚠️ GitHub tạm giới hạn lượt hỏi, đang dùng danh sách file gần nhất. Thử tải lại sau vài phút.</div>' : ''}
-                ${ONLINE.error ? '<div class="hint">⚠️ Chưa đọc được danh sách file trong thư mục data. Kiểm tra lại cài đặt GitHub Pages (xem hướng dẫn).</div>' : ''}
+                ${ONLINE.error ? `<div class="hint" style="color: var(--amber);">⚠️ Chưa đọc được danh sách file tuần. Kiểm tra: (1) trong thư mục data trên GitHub có file manifest.json; (2) tab Actions của repository không có dấu ❌ đỏ; (3) mở <a href="data/manifest.json" target="_blank" rel="noopener" style="color: var(--accent);">data/manifest.json</a> phải thấy dòng bắt đầu bằng {"built". Bạn vẫn có thể kết nối mã truy cập bên dưới để upload.</div>` : ''}
                 ${ONLINE.failed && ONLINE.failed.length ? `<div class="hint">⚠️ Không đọc được: ${ONLINE.failed.map(esc).join(' · ')}</div>` : ''}
+                ${uploaderHtml()}
                 <div class="row">
                     <button class="btn-ghost" id="btnReloadOnline">🔄 Tải lại dữ liệu</button>
-                    ${L ? `<a class="btn-ghost" href="${L.upload}" target="_blank" rel="noopener">➕ Thêm tuần trên GitHub</a>` : ''}
+                    ${L && !getToken() ? `<a class="btn-ghost" href="${L.upload}" target="_blank" rel="noopener">➕ Thêm tuần trên GitHub</a>` : ''}
                 </div>
-                <div class="hint">Upload file tuần mới vào thư mục data trên GitHub. Khoảng 1–2 phút sau, bấm "Tải lại dữ liệu" (hoặc tải lại trang) là mọi người thấy số mới.</div>`;
+                ${getToken() ? '' : '<div class="hint">Mọi người thấy số mới khoảng 1–2 phút sau khi có file tuần mới trên GitHub. Bấm "Tải lại dữ liệu" hoặc tải lại trang để cập nhật.</div>'}`;
             document.getElementById('btnReloadOnline').addEventListener('click', () => startOnline(true));
+            wireUploader();
         }
 
         async function startOnline(isReload) {
@@ -3529,7 +3721,20 @@ function normalizeCell(cell) {
             // Danh sách file đã nạp: bỏ từng file / xoá tất cả (bấm 2 lần)
             document.getElementById('sources-list').addEventListener('click', e => {
                 const b = e.target.closest('button[data-source]');
-                if (b) removeSource(b.dataset.source);
+                if (!b) return;
+                const src = sources.find(s => s.name === b.dataset.source);
+                if (src && src.isRemote) {
+                    // Xoá trên GitHub là xoá cho mọi người → bấm 2 lần
+                    if (b.dataset.armed !== '1') {
+                        b.dataset.armed = '1';
+                        b.textContent = 'Xoá?';
+                        setTimeout(() => { if (b.isConnected) { b.dataset.armed = ''; b.textContent = '✕'; } }, 3000);
+                        return;
+                    }
+                    deleteRemoteWeek(src.name);
+                    return;
+                }
+                removeSource(b.dataset.source);
             });
             const clearBtn = document.getElementById('btnClearAll');
             clearBtn.addEventListener('click', () => {
