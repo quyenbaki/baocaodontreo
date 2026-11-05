@@ -1,0 +1,12 @@
+{
+  "_huong_dan": "File cấu hình cho bản online. Thường KHÔNG cần sửa. 'repo' để trống thì trang tự nhận từ địa chỉ GitHub Pages. 'settings' là tuỳ chỉnh mặc định cho mọi người xem.",
+  "repo": "",
+  "branch": "main",
+  "settings": {
+    "greeting": "Q gửi thông tin theo dõi đơn treo",
+    "topWarehouses": 5,
+    "topReasons": 3,
+    "pdpUnit": "case",
+    "alertPercent": 20
+  }
+}
